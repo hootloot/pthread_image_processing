@@ -14,11 +14,10 @@
 #include <chrono>
 #include <sys/stat.h>
 
-constexpr int TILE_SIZE = 256;
+#define TILE_SIZE 256
 
-using FilterFunc = void (*)(unsigned char*, int, int, int);
+typedef void (*FilterFunc)(unsigned char*, int, int, int);
 
-// filters
 FilterFunc getFilter(const std::string& name) {
     if (name == "grayscale") return filterGrayscale;
     if (name == "threshold") return filterThreshold;
@@ -29,257 +28,222 @@ FilterFunc getFilter(const std::string& name) {
     return nullptr;
 }
 
-
-
 struct TileTask {
-    unsigned char* srcImage;
-    int imgWidth;
-    int imgHeight;
-    int channels;
-    int tileX;
-    int tileY;
-    int tileW;
-    int tileH;
-    std::string outputPath;
-    FilterFunc filter;  
+    unsigned char* src;
+    int imgW, imgH, channels;
+    int tileX, tileY;
+    int tileW, tileH;
+    std::string outPath;
+    FilterFunc filter;
 };
 
-
 class WorkQueue {
-private:
-    std::queue<TileTask> tasks;
-    pthread_mutex_t mutex;
-    pthread_cond_t condVar;
-    bool shutdown;
+    std::queue<TileTask> q;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+    bool done;
 
 public:
-    WorkQueue() : shutdown(false) {
-        pthread_mutex_init(&mutex, nullptr);
-        pthread_cond_init(&condVar, nullptr);
+    WorkQueue() : done(false) {
+        pthread_mutex_init(&mtx, nullptr);
+        pthread_cond_init(&cv, nullptr);
     }
 
     ~WorkQueue() {
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&condVar);
+        pthread_mutex_destroy(&mtx);
+        pthread_cond_destroy(&cv);
     }
 
-    void push(const TileTask& task) {
-        pthread_mutex_lock(&mutex);
-        tasks.push(task);
-        pthread_cond_signal(&condVar);
-        pthread_mutex_unlock(&mutex);
+    void push(const TileTask& t) {
+        pthread_mutex_lock(&mtx);
+        q.push(t);
+        pthread_cond_signal(&cv);
+        pthread_mutex_unlock(&mtx);
     }
 
-    bool pop(TileTask& task) {
-        pthread_mutex_lock(&mutex);
-        while (tasks.empty() && !shutdown) {
-            pthread_cond_wait(&condVar, &mutex);
-        }
-        if (tasks.empty()) {
-            pthread_mutex_unlock(&mutex);
+    bool pop(TileTask& t) {
+        pthread_mutex_lock(&mtx);
+        while (q.empty() && !done)
+            pthread_cond_wait(&cv, &mtx);
+
+        if (q.empty()) {
+            pthread_mutex_unlock(&mtx);
             return false;
         }
-        task = tasks.front();
-        tasks.pop();
-        pthread_mutex_unlock(&mutex);
+        t = q.front();
+        q.pop();
+        pthread_mutex_unlock(&mtx);
         return true;
     }
 
-    void signalShutdown() {
-        pthread_mutex_lock(&mutex);
-        shutdown = true;
-        pthread_cond_broadcast(&condVar);
-        pthread_mutex_unlock(&mutex);
+    void shutdown() {
+        pthread_mutex_lock(&mtx);
+        done = true;
+        pthread_cond_broadcast(&cv);
+        pthread_mutex_unlock(&mtx);
     }
 };
 
+static WorkQueue* workQueue = nullptr;
 
-WorkQueue* g_workQueue = nullptr;
+unsigned char* extractTile(const TileTask& t) {
+    unsigned char* buf = new unsigned char[t.tileW * t.tileH * t.channels];
 
+    int x0 = t.tileX * TILE_SIZE;
+    int y0 = t.tileY * TILE_SIZE;
 
-unsigned char* extractTile(const TileTask& task) {
-    int tileBytes = task.tileW * task.tileH * task.channels;
-    unsigned char* tile = new unsigned char[tileBytes];
-    
-    int startX = task.tileX * TILE_SIZE;
-    int startY = task.tileY * TILE_SIZE;
-    
-    for (int y = 0; y < task.tileH; ++y) {
-        int srcY = startY + y;
-        int srcIdx = (srcY * task.imgWidth + startX) * task.channels;
-        int dstIdx = y * task.tileW * task.channels;
-        memcpy(tile + dstIdx, task.srcImage + srcIdx, task.tileW * task.channels);
+    for (int row = 0; row < t.tileH; row++) {
+        int srcOff = ((y0 + row) * t.imgW + x0) * t.channels;
+        int dstOff = row * t.tileW * t.channels;
+        memcpy(buf + dstOff, t.src + srcOff, t.tileW * t.channels);
     }
-    
-    return tile;
+    return buf;
 }
 
-void* workerThread(void* arg) {
-    int threadId = *static_cast<int*>(arg);
-    delete static_cast<int*>(arg);
-    
+void* workerFunc(void* arg) {
+    int id = *((int*)arg);
+    delete (int*)arg;
+
     TileTask task;
-    while (g_workQueue->pop(task)) {
-        unsigned char* tileData = extractTile(task);
-        
-        if (task.filter) {
-            task.filter(tileData, task.tileW, task.tileH, task.channels);
-        }
-        
-        int success = stbi_write_png(
-            task.outputPath.c_str(),
-            task.tileW,
-            task.tileH,
-            task.channels,
-            tileData,
-            task.tileW * task.channels
-        );
-        
-        if (success) {
-            printf("[Thread %d] Saved: %s (%dx%d)\n", 
-                   threadId, task.outputPath.c_str(), task.tileW, task.tileH);
+    while (workQueue->pop(task)) {
+        unsigned char* data = extractTile(task);
+
+        if (task.filter)
+            task.filter(data, task.tileW, task.tileH, task.channels);
+
+        if (stbi_write_png(task.outPath.c_str(),
+                           task.tileW, task.tileH,
+                           task.channels, data,
+                           task.tileW * task.channels)) {
+            printf("[thread %d] wrote %s (%dx%d)\n",
+                   id, task.outPath.c_str(), task.tileW, task.tileH);
         } else {
-            fprintf(stderr, "[Thread %d] Failed to save: %s\n", 
-                    threadId, task.outputPath.c_str());
+            fprintf(stderr, "[thread %d] FAILED to write %s\n",
+                    id, task.outPath.c_str());
         }
-        
-        delete[] tileData;
+
+        delete[] data;
     }
-    
-    printf("[Thread %d] Shutting down\n", threadId);
+
+    printf("[thread %d] done\n", id);
     return nullptr;
 }
 
 class ThreadPool {
-private:
     std::vector<pthread_t> threads;
-    int numThreads;
-
+    int count;
 public:
-    ThreadPool(int n) : numThreads(n) {
-        threads.resize(n);
-        for (int i = 0; i < n; ++i) {
-            int* threadId = new int(i);
-            if (pthread_create(&threads[i], nullptr, workerThread, threadId) != 0) {
-                fprintf(stderr, "Failed to create thread %d\n", i);
-                delete threadId;
+    ThreadPool(int n) : count(n), threads(n) {
+        for (int i = 0; i < n; i++) {
+            int* id = new int(i);
+            if (pthread_create(&threads[i], nullptr, workerFunc, id)) {
+                fprintf(stderr, "couldn't create thread %d\n", i);
+                delete id;
             }
         }
-        printf("Created %d worker threads\n", n);
+        printf("spun up %d threads\n", n);
     }
 
-    void waitAll() {
-        for (int i = 0; i < numThreads; ++i) {
+    void join() {
+        for (int i = 0; i < count; i++)
             pthread_join(threads[i], nullptr);
-        }
-        printf("All threads joined\n");
+        printf("all threads joined\n");
     }
 };
 
-void ensureDirectory(const std::string& path) {
-    #ifdef _WIN32
+static void mkdirSafe(const std::string& path) {
+#ifdef _WIN32
     _mkdir(path.c_str());
-    #else
+#else
     mkdir(path.c_str(), 0755);
-    #endif
+#endif
 }
 
-
-
-
-
-
-
-
 int main(int argc, char* argv[]) {
+    if (argc < 5) {
+        fprintf(stderr, "usage: %s <input> <outdir> <threads> <filter>\n", argv[0]);
+        return 1;
+    }
 
-
-    const char* inputPath = argv[1];
-    std::string outputDir = argv[2];
-    int threadCount = atoi(argv[3]);
+    const char* inputPath  = argv[1];
+    std::string outDir     = argv[2];
+    int nThreads           = atoi(argv[3]);
     std::string filterName = argv[4];
 
-    if (threadCount < 1) {
-        fprintf(stderr, "Thread count must be at least 1\n");
+    if (nThreads < 1) {
+        fprintf(stderr, "need at least 1 thread\n");
         return 1;
     }
 
     FilterFunc filter = getFilter(filterName);
     if (!filter && filterName != "none") {
-        fprintf(stderr, "Unknown filter: %s\n", filterName.c_str());
+        fprintf(stderr, "unknown filter '%s'\n", filterName.c_str());
         return 1;
     }
 
-    if (!outputDir.empty() && outputDir.back() != '/' && outputDir.back() != '\\') {
-        outputDir += '/';
-    }
-    ensureDirectory(outputDir);
+    if (!outDir.empty() && outDir.back() != '/' && outDir.back() != '\\')
+        outDir += '/';
+    mkdirSafe(outDir);
 
-    auto startTime = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-    printf("Loading image: %s\n", inputPath);
-    int width, height, channels;
-    unsigned char* image = stbi_load(inputPath, &width, &height, &channels, 0);
-    
-    if (!image) {
-        fprintf(stderr, "Failed to load image: %s\n", inputPath);
-        fprintf(stderr, "Reason: %s\n", stbi_failure_reason());
+    printf("loading %s...\n", inputPath);
+    int w, h, ch;
+    unsigned char* img = stbi_load(inputPath, &w, &h, &ch, 0);
+    if (!img) {
+        fprintf(stderr, "can't load image: %s (%s)\n",
+                inputPath, stbi_failure_reason());
         return 1;
     }
-    printf("Image loaded: %dx%d, %d channels\n", width, height, channels);
-    printf("Applying filter: %s\n", filterName.c_str());
+    printf("loaded: %dx%d, %d ch\n", w, h, ch);
+    printf("filter: %s\n", filterName.c_str());
 
-    int tilesX = (width + TILE_SIZE - 1) / TILE_SIZE;
-    int tilesY = (height + TILE_SIZE - 1) / TILE_SIZE;
-    int totalTiles = tilesX * tilesY;
-    printf("Splitting into %dx%d grid (%d tiles)\n", tilesX, tilesY, totalTiles);
+    int nx = (w + TILE_SIZE - 1) / TILE_SIZE;
+    int ny = (h + TILE_SIZE - 1) / TILE_SIZE;
+    int total = nx * ny;
+    printf("grid: %dx%d = %d tiles\n", nx, ny, total);
 
-    g_workQueue = new WorkQueue();
-    ThreadPool pool(threadCount);
+    workQueue = new WorkQueue();
+    ThreadPool pool(nThreads);
 
-    for (int ty = 0; ty < tilesY; ++ty) {
-        for (int tx = 0; tx < tilesX; ++tx) {
-            TileTask task;
-            task.srcImage = image;
-            task.imgWidth = width;
-            task.imgHeight = height;
-            task.channels = channels;
-            task.tileX = tx;
-            task.tileY = ty;
-            task.filter = filter; 
-            
-            int startX = tx * TILE_SIZE;
-            int startY = ty * TILE_SIZE;
-            task.tileW = std::min(TILE_SIZE, width - startX);
-            task.tileH = std::min(TILE_SIZE, height - startY);
-            
-            char filename[256];
-            snprintf(filename, sizeof(filename), "%stile_%02d_%02d.png", 
-                     outputDir.c_str(), ty, tx);
-            task.outputPath = filename;
-            
-            g_workQueue->push(task);
+    for (int ty = 0; ty < ny; ty++) {
+        for (int tx = 0; tx < nx; tx++) {
+            int sx = tx * TILE_SIZE;
+            int sy = ty * TILE_SIZE;
+
+            TileTask t;
+            t.src      = img;
+            t.imgW     = w;
+            t.imgH     = h;
+            t.channels = ch;
+            t.tileX    = tx;
+            t.tileY    = ty;
+            t.tileW    = std::min(TILE_SIZE, w - sx);
+            t.tileH    = std::min(TILE_SIZE, h - sy);
+            t.filter   = filter;
+
+            char fname[256];
+            snprintf(fname, sizeof(fname), "%stile_%02d_%02d.png",
+                     outDir.c_str(), ty, tx);
+            t.outPath = fname;
+
+            workQueue->push(t);
         }
     }
+    printf("queued %d tasks\n", total);
 
-    printf("Queued %d tile tasks\n", totalTiles);
+    workQueue->shutdown();
+    pool.join();
 
-    g_workQueue->signalShutdown();
-    pool.waitAll();
+    stbi_image_free(img);
+    delete workQueue;
 
-    stbi_image_free(image);
-    delete g_workQueue;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        endTime - startTime
-    ).count();
-
-    printf("Processing complete!\n");
-    printf("Filter: %s\n", filterName.c_str());
-    printf("Total tiles: %d\n", totalTiles);
-    printf("Threads used: %d\n", threadCount);
-    printf("Elapsed time: %lld ms\n", duration);
+    printf("\ndone\n");
+    printf("filter: %s | tiles: %d | threads: %d | time: %lld ms\n",
+           filterName.c_str(), total, nThreads, ms);
 
     return 0;
 }
